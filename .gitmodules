@@ -1,0 +1,3 @@
+[submodule "k8s-bootstrap"]
+	path = k8s-bootstrap
+	url = https://github.com/GordeyTsy/k8s-bootstrap.git
