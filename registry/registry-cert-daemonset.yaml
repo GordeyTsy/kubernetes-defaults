@@ -1,0 +1,248 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: registry-cert-installer-script
+  namespace: default
+data:
+  install.sh: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+
+    CERT_SRC="/certs/tls.crt"
+
+    # ХОСТОВЫЕ пути (смонтированы в /host)
+    HOST_CA_DIR="/host/usr/local/share/ca-certificates"
+    HOST_CA="${HOST_CA_DIR}/registry.crt"
+
+    # containerd/docker каталоги для host и host:443
+    CTR_DIR1="/host/etc/containerd/certs.d/registry"
+    CTR_CA1="${CTR_DIR1}/ca.crt"
+    CTR_HOSTS1="${CTR_DIR1}/hosts.toml"
+
+    CTR_DIR2="/host/etc/containerd/certs.d/registry:443"
+    CTR_CA2="${CTR_DIR2}/ca.crt"
+    CTR_HOSTS2="${CTR_DIR2}/hosts.toml"
+
+    DOCKER_DIR1="/host/etc/docker/certs.d/registry"
+    DOCKER_CA1="${DOCKER_DIR1}/ca.crt"
+    DOCKER_DIR2="/host/etc/docker/certs.d/registry:443"
+    DOCKER_CA2="${DOCKER_DIR2}/ca.crt"
+
+    HOSTS_FILE="/host/etc/hosts"
+
+    REG_NAME="${REGISTRY_NAME:-registry}"
+    REG_FQDN="${REGISTRY_FQDN:-registry.default.svc.cluster.local}"
+    RUNTIME_SERVICE="${RUNTIME_SERVICE:-containerd}"
+    SYNC_INTERVAL="${SYNC_INTERVAL_SECONDS:-300}"
+    PREPULL="${PREPULL_IMAGES:-}"
+
+    copy_if_changed () {
+      local src="$1" dst="$2"
+      mkdir -p "$(dirname "$dst")"
+      if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
+        cp -f "$src" "$dst"
+        return 0
+      fi
+      return 1
+    }
+
+    write_file_if_diff () {
+      local content="$1" dst="$2"
+      mkdir -p "$(dirname "$dst")"
+      local tmp; tmp="$(mktemp)"
+      printf "%s" "$content" > "$tmp"
+      if [ ! -f "$dst" ] || ! cmp -s "$tmp" "$dst"; then
+        mv -f "$tmp" "$dst"; return 0
+      fi
+      rm -f "$tmp"; return 1
+    }
+
+    ensure_hosts_mapping () {
+      # Берём актуальный ClusterIP сервиса через DNS внутри пода
+      local ip
+      ip="$(getent ahostsv4 "${REG_FQDN}" | awk 'NR==1{print $1}')"
+      [ -n "${ip:-}" ] || { echo "[registry-cert] WARN: can't resolve ${REG_FQDN}"; return 1; }
+
+      # Удалим любые старые строки, где среди имён встречается ${REG_NAME}
+      if grep -qw "${REG_NAME}" "$HOSTS_FILE"; then
+        local tmp; tmp="$(mktemp)"
+        awk -v name="${REG_NAME}" '
+          {
+            keep=1
+            # начиная со второй колонки (IP уже первая)
+            for(i=2;i<=NF;i++){ if($i==name){ keep=0; break } }
+            if(keep) print $0
+          }' "$HOSTS_FILE" > "$tmp"
+        cat "$tmp" > "$HOSTS_FILE"; rm -f "$tmp"
+      fi
+
+      # Добавим новую актуальную строку
+      echo "${ip} ${REG_NAME}" >> "$HOSTS_FILE"
+      echo "[registry-cert] /etc/hosts ensured: ${ip} ${REG_NAME}"
+    }
+
+    ensure_hosts_toml () {
+      # $1 = host[:port], $2 = ca-path, $3 = hosts.toml path
+      local hp="$1" ca="$2" path="$3"
+      local content
+      content=$(printf 'server = "https://%s"\n\n[host."https://%s"]\n  capabilities = ["pull","resolve","push"]\n  ca = "%s"\n' "$hp" "$hp" "$ca")
+      write_file_if_diff "${content}" "${path}" && echo "[registry-cert] hosts.toml updated for ${hp}" && return 0
+      return 1
+    }
+
+    restart_runtime_if_needed () {
+      local need="$1"
+      if [ "$need" -eq 1 ]; then
+        echo "[registry-cert] Restarting ${RUNTIME_SERVICE} (or docker fallback)"
+        nsenter --target 1 --mount --uts --ipc --net --pid -- bash -lc "systemctl restart ${RUNTIME_SERVICE} || systemctl restart docker || true"
+      fi
+    }
+
+    do_prepull_images () {
+      [ -n "${PREPULL}" ] || return 0
+      echo "[registry-cert] Prepull images: ${PREPULL}"
+      nsenter --target 1 --mount --uts --ipc --net --pid -- bash -lc '
+        set -euo pipefail
+        if command -v ctr >/dev/null 2>&1; then
+          IFS=" ," read -r -a arr <<< "'"${PREPULL}"'"
+          for img in "${arr[@]}"; do [ -n "$img" ] || continue; echo "[host] ctr pulling $img"; ctr --namespace k8s.io images pull "$img" || true; done
+        elif command -v docker >/dev/null 2>&1; then
+          IFS=" ," read -r -a arr <<< "'"${PREPULL}"'"
+          for img in "${arr[@]}"; do [ -n "$img" ] || continue; echo "[host] docker pulling $img"; docker pull "$img" || true; done
+        else
+          echo "[host] WARN: neither ctr nor docker found"
+        fi
+      '
+    }
+
+    first_run=1
+    while :; do
+      UPDATED_CA=0; UPDATED_CTR=0
+
+      # 1) Копируем/обновляем сертификаты в системный store и каталоги containerd/docker (host и host:443)
+      copy_if_changed "$CERT_SRC" "$HOST_CA"  && UPDATED_CA=1
+      copy_if_changed "$CERT_SRC" "$CTR_CA1" && UPDATED_CTR=1
+      copy_if_changed "$CERT_SRC" "$DOCKER_CA1" || true
+      copy_if_changed "$CERT_SRC" "$CTR_CA2" && UPDATED_CTR=1
+      copy_if_changed "$CERT_SRC" "$DOCKER_CA2" || true
+
+      # 2) hosts.toml для containerd (host и host:443)
+      ensure_hosts_toml "${REG_NAME}"     "${CTR_CA1}" "${CTR_HOSTS1}" && UPDATED_CTR=1 || true
+      ensure_hosts_toml "${REG_NAME}:443" "${CTR_CA2}" "${CTR_HOSTS2}" && UPDATED_CTR=1 || true
+
+      # 3) /etc/hosts → единственная актуальная строка "ClusterIP registry"
+      ensure_hosts_mapping || true
+
+      # 4) Если менялся системный CA — обновим системные корни
+      if [ "$UPDATED_CA" -eq 1 ]; then
+        echo "[registry-cert] System CA changed -> update-ca-certificates"
+        nsenter --target 1 --mount --uts --ipc --net --pid -- bash -lc "update-ca-certificates || true"
+      fi
+
+      # 5) Перезапуск runtime при изменениях
+      if [ "$UPDATED_CTR" -eq 1 ] || [ "$UPDATED_CA" -eq 1 ]; then
+        restart_runtime_if_needed 1
+      else
+        [ "$first_run" -eq 1 ] && echo "[registry-cert] Nothing to restart; CA/hosts.toml up-to-date."
+      fi
+
+      # 6) Первая итерация — опциональная предзагрузка образов
+      if [ "$first_run" -eq 1 ]; then
+        do_prepull_images || true
+        first_run=0
+      fi
+
+      sleep "${SYNC_INTERVAL}"
+    done
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: registry-cert-installer
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: registry-cert-installer
+  template:
+    metadata:
+      labels:
+        app: registry-cert-installer
+    spec:
+      hostPID: true
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: installer
+          image: alpine:3.20
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: REGISTRY_NAME
+              value: "registry"
+            - name: REGISTRY_FQDN
+              value: "registry.default.svc.cluster.local"
+            - name: RUNTIME_SERVICE
+              value: "containerd"
+            - name: SYNC_INTERVAL_SECONDS
+              value: "300"
+            # Можно указать образы для предзагрузки через запятую/пробел:
+            # пример: "registry:443/codex-dev-check:latest registry/codex-registry-test:v1"
+            - name: PREPULL_IMAGES
+              value: ""
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eux
+              apk add --no-cache bash util-linux coreutils bind-tools ca-certificates
+              /bin/bash /opt/bin/install.sh
+          volumeMounts:
+            - name: registry-tls
+              mountPath: /certs
+              readOnly: true
+            - name: script
+              mountPath: /opt/bin/install.sh
+              subPath: install.sh
+              readOnly: true
+            - name: host-ca
+              mountPath: /host/usr/local/share/ca-certificates
+            - name: host-containerd
+              mountPath: /host/etc/containerd/certs.d
+            - name: host-docker
+              mountPath: /host/etc/docker/certs.d
+            - name: host-etc-hosts
+              mountPath: /host/etc/hosts
+              readOnly: false
+      volumes:
+        - name: registry-tls
+          secret:
+            secretName: registry-tls
+            items:
+              - key: tls.crt
+                path: tls.crt
+        - name: script
+          configMap:
+            name: registry-cert-installer-script
+            defaultMode: 0555
+        - name: host-ca
+          hostPath:
+            path: /usr/local/share/ca-certificates
+            type: DirectoryOrCreate
+        - name: host-containerd
+          hostPath:
+            path: /etc/containerd/certs.d
+            type: DirectoryOrCreate
+        - name: host-docker
+          hostPath:
+            path: /etc/docker/certs.d
+            type: DirectoryOrCreate
+        - name: host-etc-hosts
+          hostPath:
+            path: /etc/hosts
+            type: File

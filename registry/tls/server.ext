@@ -1,0 +1,9 @@
+subjectAltName = @alt_names
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+[alt_names]
+DNS.1 = registry
+DNS.2 = registry.default
+DNS.3 = registry.default.svc
+DNS.4 = registry.default.svc.cluster.local
