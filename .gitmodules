@@ -1,3 +1,9 @@
 [submodule "k8s-bootstrap"]
 	path = k8s-bootstrap
 	url = https://github.com/GordeyTsy/k8s-bootstrap.git
+[submodule "ph-network"]
+	path = ph-network
+	url = https://github.com/GordeyTsy/ph-network.git
+[submodule "registry"]
+	path = registry
+	url = https://github.com/GordeyTsy/registry.git
