@@ -7,3 +7,6 @@
 [submodule "registry"]
 	path = registry
 	url = https://github.com/GordeyTsy/registry.git
+[submodule "vless-mesh"]
+	path = vless-mesh
+	url = https://github.com/GordeyTsy/vless-mesh.git
