@@ -1,0 +1,263 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: longhorn-disk-prep
+  namespace: longhorn-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: longhorn-disk-prep
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: longhorn-disk-prep
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: longhorn-disk-prep
+subjects:
+  - kind: ServiceAccount
+    name: longhorn-disk-prep
+    namespace: longhorn-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: longhorn-disk-prep-script
+  namespace: longhorn-system
+data:
+  prep.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    NODE_NAME="${NODE_NAME:-$(cat /etc/hostname)}"
+    HOST_DEV="/host/dev"
+    HOST_ETC="/host/etc"
+    DISK_BASE="/var/lib/longhorn/disks"
+    mkdir -p "/host${DISK_BASE}"
+
+    echo "[prep] Scanning disks on ${NODE_NAME}..."
+    nsenter --target 1 --mount --uts --ipc --net --pid -- lsblk -J -o NAME,TYPE,ROTA,MOUNTPOINT,FSTYPE,PKNAME > /tmp/lsblk.json
+    mapfile -t CANDIDATES < <(jq -r '
+      .. | objects
+      | select(.type=="disk" or .type=="part")
+      | select(.name|test("^(sd|vd|xvd|nvme|mmcblk)"))
+      | select(.fstype==null or .fstype=="ext4")
+      | select(if .type=="disk" then ((.children|length)==0 or .children==null) else true end)
+      | "\(.name):\(
+          if (.rota == false or .rota == 0 or .rota == "0") then
+            "ssd"
+          else
+            "hdd"
+          end
+        ):\(.mountpoint // ""):\(.fstype // "")"
+      ' /tmp/lsblk.json)
+
+    if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+      echo "[prep] No free disks detected; nothing to do."
+      exit 0
+    fi
+
+    DISK_CFG=()
+    MIN_BYTES=$((8 * 1024 * 1024 * 1024))
+
+    for entry in "${CANDIDATES[@]}"; do
+      IFS=':' read -r name tag mountpoint fstype <<<"${entry}"
+      dev_host="${HOST_DEV}/${name}"
+      dev_mount="/dev/${name}"
+      if [[ -n "${mountpoint}" ]]; then
+        mnt="${mountpoint}"
+        existing_mount=1
+      else
+        mnt="${DISK_BASE}/${name}"
+        existing_mount=0
+      fi
+
+      if [[ ! -b "${dev_host}" ]]; then
+        echo "[prep] Skip ${name}: no block device at ${dev_host}."
+        continue
+      fi
+
+      # Format only if no filesystem
+      if ! blkid -o value -s TYPE "${dev_host}" >/dev/null 2>&1; then
+        echo "[prep] Wiping and formatting ${dev_mount} as ext4..."
+        wipefs -fa "${dev_host}" || true
+        mkfs.ext4 -F "${dev_host}"
+      else
+        echo "[prep] ${dev_mount} already formatted; leaving as is."
+      fi
+
+      # Mount and persist only after a successful mount to avoid leaving broken fstab entries
+      if [[ "${existing_mount}" -eq 0 ]]; then
+        if ! nsenter --target 1 --mount --uts --ipc --net --pid -- bash -lc "mkdir -p '${mnt}' && mountpoint -q '${mnt}' || mount '${dev_mount}' '${mnt}'"; then
+          echo "[prep] WARN: failed to mount ${dev_mount} at ${mnt}, skipping."
+          continue
+        fi
+        if ! grep -qE "^[^#]*${dev_mount}[[:space:]]+${mnt}[[:space:]]" "${HOST_ETC}/fstab" 2>/dev/null; then
+          echo "[prep] Adding ${dev_mount} to fstab at ${mnt}"
+          echo "${dev_mount} ${mnt} ext4 defaults 0 2" >> "${HOST_ETC}/fstab"
+        fi
+      else
+        # ensure mountpoint exists and has room; skip system mounts
+        case "${mnt}" in
+          /|/boot*|/usr*|/opt*|/run*|/home|/home/*)
+            echo "[prep] Skip system mount ${mnt}"
+            continue
+            ;;
+          /var/lib/kubelet/*|/var/lib/longhorn/volumes/*)
+            echo "[prep] Skip kubelet/Longhorn mount ${mnt}"
+            continue
+            ;;
+        esac
+      fi
+
+      avail=$(nsenter --target 1 --mount --uts --ipc --net --pid -- df -B1 --output=avail "${mnt}" 2>/dev/null | tail -1 | tr -d '[:space:]' || echo 0)
+      if [[ -z "${avail}" || "${avail}" -lt "${MIN_BYTES}" ]]; then
+        echo "[prep] Skip ${mnt}: available ${avail:-0} bytes < ${MIN_BYTES}"
+        continue
+      fi
+
+      DISK_CFG+=( "$(jq -nc --arg name "disk-${name}" --arg path "${mnt}" --arg tag "${tag}" '{name:$name,path:$path,allowScheduling:true,tags:[$tag]}')" )
+    done
+
+    # Always include the Longhorn default disk path with a tag based on the root device
+    default_path="/var/lib/longhorn/"
+    root_src="$(nsenter --target 1 --mount --uts --ipc --net --pid -- findmnt -n -o SOURCE / || true)"
+    root_dev="$(nsenter --target 1 --mount --uts --ipc --net --pid -- readlink -f "${root_src}" 2>/dev/null || true)"
+    root_block="$(basename "${root_dev:-}" | sed 's/[0-9]*$//')"
+    rota="1"
+    if [[ -n "${root_block}" && -r "/sys/block/${root_block}/queue/rotational" ]]; then
+      rota="$(cat "/sys/block/${root_block}/queue/rotational" 2>/dev/null | tr -d '[:space:]' || echo 1)"
+    fi
+    default_tag="hdd"
+    if [[ "${rota}" == "0" ]]; then
+      default_tag="ssd"
+    fi
+    DISK_CFG+=( "$(jq -nc --arg name "default-disk-root" --arg path "${default_path}" --arg tag "${default_tag}" '{name:$name,path:$path,allowScheduling:true,storageReserved:42949672960,tags:[$tag]}')" )
+
+    if [[ ${#DISK_CFG[@]} -eq 0 ]]; then
+      echo "[prep] Nothing to configure for Longhorn."
+      exit 0
+    fi
+
+    cfg_json=$(printf '%s\n' "${DISK_CFG[@]}" | jq -s .)
+    echo "[prep] Patching node ${NODE_NAME} with default disk config: ${cfg_json}"
+    nsenter --target 1 --mount --uts --ipc --net --pid -- env KUBECONFIG=/etc/kubernetes/admin.conf kubectl patch node "${NODE_NAME}" --type merge -p "$(jq -nc --argjson cfg "${cfg_json}" '{metadata:{annotations:{"node.longhorn.io/default-disks-config":($cfg|tostring)}, labels:{"node.longhorn.io/create-default-disk":"true"}}}')"
+
+    # Also push the same disk config into the Longhorn Node spec so the manager sees
+    # the tagged disks immediately (without relying solely on the annotation). Retry
+    # until the nodes.longhorn.io CR exists or timeout.
+    disk_spec=$(printf '%s\n' "${DISK_CFG[@]}" | jq -s '
+      map({
+        key: .name,
+        value: {
+          allowScheduling: true,
+          diskDriver: "",
+          diskType: "filesystem",
+          evictionRequested: false,
+          path: .path,
+          storageReserved: (.storageReserved // 0),
+          tags: .tags
+        }
+      }) | from_entries
+    ')
+    if [[ -n "${disk_spec}" && "${disk_spec}" != "null" ]]; then
+      patched=0
+      for _ in $(seq 1 30); do
+        if nsenter --target 1 --mount --uts --ipc --net --pid -- env KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n longhorn-system get nodes.longhorn.io "${NODE_NAME}" >/dev/null 2>&1; then
+          if nsenter --target 1 --mount --uts --ipc --net --pid -- env KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n longhorn-system patch nodes.longhorn.io "${NODE_NAME}" --type merge -p "$(jq -nc --argjson disks "${disk_spec}" '{spec:{disks:$disks}}')" >/dev/null 2>&1; then
+            patched=1
+            break
+          fi
+        fi
+        sleep 5
+      done
+      if [[ ${patched} -ne 1 ]]; then
+        echo "[prep] WARN: failed to patch nodes.longhorn.io/${NODE_NAME} with disk spec (timeout)."
+      fi
+    fi
+    echo "[prep] Done for ${NODE_NAME}"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: longhorn-disk-prep
+  namespace: longhorn-system
+  labels:
+    app: longhorn-disk-prep
+spec:
+  selector:
+    matchLabels:
+      app: longhorn-disk-prep
+  template:
+    metadata:
+      labels:
+        app: longhorn-disk-prep
+    spec:
+      serviceAccountName: longhorn-disk-prep
+      hostPID: true
+      hostNetwork: true
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: prep
+          image: alpine:3.20
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache util-linux e2fsprogs jq curl ca-certificates bash
+              cp /opt/prep/prep.sh /usr/local/bin/prep.sh
+              chmod +x /usr/local/bin/prep.sh
+              bash /usr/local/bin/prep.sh
+              # stay alive so DaemonSet is Ready; re-run every 10 minutes
+              while true; do sleep 600; bash /usr/local/bin/prep.sh || true; done
+          volumeMounts:
+            - name: script
+              mountPath: /opt/prep/prep.sh
+              subPath: prep.sh
+              readOnly: true
+            - name: host-dev
+              mountPath: /host/dev
+            - name: host-etc
+              mountPath: /host/etc
+            - name: host-var
+              mountPath: /host/var/lib
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: longhorn-disk-prep-script
+            defaultMode: 0555
+        - name: host-dev
+          hostPath:
+            path: /dev
+        - name: host-etc
+          hostPath:
+            path: /etc
+        - name: host-var
+          hostPath:
+            path: /var/lib
+        - name: host-proc
+          hostPath:
+            path: /proc

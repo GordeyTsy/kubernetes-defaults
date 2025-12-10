@@ -33,8 +33,6 @@ spec:
       labels:
         app: registry
     spec:
-      nodeSelector:
-        kubernetes.io/hostname: k8s-hdd
       containers:
         - name: registry
           image: registry:2
@@ -80,9 +78,8 @@ spec:
               memory: 1Gi
       volumes:
         - name: storage
-          hostPath:
-            path: /mnt/storage/registry
-            type: DirectoryOrCreate
+          persistentVolumeClaim:
+            claimName: registry-data
         - name: config
           configMap:
             name: registry-config
@@ -106,4 +103,3 @@ spec:
     - name: https
       port: 443
       targetPort: 5000
-

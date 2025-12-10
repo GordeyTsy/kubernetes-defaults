@@ -15,7 +15,6 @@ spec:
       labels:
         app: dnscrypt-proxy
     spec:
-      nodeName: k8s-hdd
       containers:
       - name: dnscrypt-proxy
         image: registry:443/dnscrypt-proxy:latest
@@ -24,23 +23,21 @@ spec:
           protocol: TCP
         - containerPort: 53
           protocol: UDP
-#---
-#apiVersion: v1
-#kind: Service
-#metadata:
-#  name: dnscrypt-proxy-svc
-#spec:
-#  type: ClusterIP
-#  # Указываем статичный ClusterIP (убедитесь, что этот IP допустим для вашего кластера)
-#  clusterIP: 10.97.113.244
-#  selector:
-#    app: dnscrypt-proxy
-#  ports:
-#  - name: dns-tcp
-#    protocol: TCP
-#    port: 53
-#    targetPort: 53
-#  - name: dns-udp
-#    protocol: UDP
-#    port: 53
-#    targetPort: 53
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dnscrypt-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: dnscrypt-proxy
+  ports:
+  - name: dns-tcp
+    protocol: TCP
+    port: 53
+    targetPort: 53
+  - name: dns-udp
+    protocol: UDP
+    port: 53
+    targetPort: 53
