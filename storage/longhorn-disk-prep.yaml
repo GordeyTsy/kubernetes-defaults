@@ -12,6 +12,9 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "patch", "update"]
+  - apiGroups: ["longhorn.io"]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -148,7 +151,7 @@ data:
 
     cfg_json=$(printf '%s\n' "${DISK_CFG[@]}" | jq -s .)
     echo "[prep] Patching node ${NODE_NAME} with default disk config: ${cfg_json}"
-    nsenter --target 1 --mount --uts --ipc --net --pid -- env KUBECONFIG=/etc/kubernetes/admin.conf kubectl patch node "${NODE_NAME}" --type merge -p "$(jq -nc --argjson cfg "${cfg_json}" '{metadata:{annotations:{"node.longhorn.io/default-disks-config":($cfg|tostring)}, labels:{"node.longhorn.io/create-default-disk":"true"}}}')"
+    kubectl patch node "${NODE_NAME}" --type merge -p "$(jq -nc --argjson cfg "${cfg_json}" '{metadata:{annotations:{"node.longhorn.io/default-disks-config":($cfg|tostring)}, labels:{"node.longhorn.io/create-default-disk":"true"}}}')"
 
     # Also push the same disk config into the Longhorn Node spec so the manager sees
     # the tagged disks immediately (without relying solely on the annotation). Retry
@@ -170,8 +173,8 @@ data:
     if [[ -n "${disk_spec}" && "${disk_spec}" != "null" ]]; then
       patched=0
       for _ in $(seq 1 30); do
-        if nsenter --target 1 --mount --uts --ipc --net --pid -- env KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n longhorn-system get nodes.longhorn.io "${NODE_NAME}" >/dev/null 2>&1; then
-          if nsenter --target 1 --mount --uts --ipc --net --pid -- env KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n longhorn-system patch nodes.longhorn.io "${NODE_NAME}" --type merge -p "$(jq -nc --argjson disks "${disk_spec}" '{spec:{disks:$disks}}')" >/dev/null 2>&1; then
+        if kubectl -n longhorn-system get nodes.longhorn.io "${NODE_NAME}" >/dev/null 2>&1; then
+          if kubectl -n longhorn-system patch nodes.longhorn.io "${NODE_NAME}" --type merge -p "$(jq -nc --argjson disks "${disk_spec}" '{spec:{disks:$disks}}')" >/dev/null 2>&1; then
             patched=1
             break
           fi
@@ -203,6 +206,7 @@ spec:
       serviceAccountName: longhorn-disk-prep
       hostPID: true
       hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       tolerations:
         - key: "node-role.kubernetes.io/control-plane"
           operator: "Exists"
@@ -212,7 +216,7 @@ spec:
           effect: "NoSchedule"
       containers:
         - name: prep
-          image: alpine:3.20
+          image: debian:12-slim
           securityContext:
             privileged: true
           env:
@@ -224,7 +228,10 @@ spec:
           args:
             - |
               set -e
-              apk add --no-cache util-linux e2fsprogs jq curl ca-certificates bash
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -y
+              apt-get install -y --no-install-recommends util-linux e2fsprogs jq curl ca-certificates bash
+              rm -rf /var/lib/apt/lists/*
               cp /opt/prep/prep.sh /usr/local/bin/prep.sh
               chmod +x /usr/local/bin/prep.sh
               bash /usr/local/bin/prep.sh
@@ -234,6 +241,9 @@ spec:
             - name: script
               mountPath: /opt/prep/prep.sh
               subPath: prep.sh
+              readOnly: true
+            - name: host-kubectl
+              mountPath: /usr/local/bin/kubectl
               readOnly: true
             - name: host-dev
               mountPath: /host/dev
@@ -249,6 +259,10 @@ spec:
           configMap:
             name: longhorn-disk-prep-script
             defaultMode: 0555
+        - name: host-kubectl
+          hostPath:
+            path: /usr/bin/kubectl
+            type: File
         - name: host-dev
           hostPath:
             path: /dev

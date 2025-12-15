@@ -3,7 +3,7 @@
 Opinionated kubeadm bootstrap plus a grab‑bag of cluster modules and mesh tooling. Use `bootstrap-master.sh` on a fresh Ubuntu host to bring up a control-plane and apply the bundled modules.
 
 ## Layout
-- `bootstrap-master.sh` — thin wrapper around `k8s-bootstrap/bootstrap.sh` for end-to-end control-plane bootstrap. Installs runc + containerd (latest upstream by default), kubeadm/kubelet/kubectl (latest stable from pkgs.k8s.io by default), deploys Calico, and applies selected modules (`dns gpu registry storage vless-mesh` by default; add `--with-ph-network` to include `ph-network`).
+- `bootstrap-master.sh` — thin wrapper around `k8s-bootstrap/bootstrap.sh` for end-to-end control-plane bootstrap. Installs runc + containerd (latest upstream by default), kubeadm/kubelet/kubectl (latest stable from pkgs.k8s.io by default), deploys Calico, and applies selected modules (`dns gpu registry storage vless-mesh` by default).
 - `k8s-bootstrap/` — bootstrap logic and host-prep notes; `bootstrap.sh` contains the main flow, `dev/setup.sh` has the LUKS + systemd-nspawn experiment.
 - `gpu/` — NVIDIA support: installs the device plugin DaemonSet + RuntimeClass, expects nodes labeled `nvidia.com/gpu.present=true` (labeling is auto-done by bootstrap when a GPU + toolkit are detected).
 - `dns/` — dnscrypt-proxy Deployment + Service, CoreDNS patched to forward to it with fallback 8.8.8.8.
@@ -11,8 +11,13 @@ Opinionated kubeadm bootstrap plus a grab‑bag of cluster modules and mesh tool
 - `registry/` — private Docker registry with TLS: deployment/service, TLS materials under `tls/`, and a daemonset that propagates the registry CA + hosts.toml into every node runtime (containerd/docker).
 - `storage/` — Longhorn references plus two StorageClasses (`longhorn-ssd`, `longhorn-hdd`). `storage/install.sh` installs Longhorn (default v1.10.0), untaints control-plane/master nodes for single-node clusters, deploys a DaemonSet that auto-prepares free disks and patches Longhorn node disk config, and applies the StorageClasses. Set `APPLY_STORAGE_TEST=1` to also create a `storage-test` namespace with the sample PVC/Pod under `storage/test/`.
 - `gpu/` — note on making `nvidia-container-runtime` the default runtime for containerd so the NVIDIA device plugin can see GPUs.
-- `vless-mesh/` — VLESS+Reality transport carrying a tinc L2 mesh; includes `setup-server`/`setup-client` scripts, Docker/compose/k8s deployment helpers, and a small Django backend (`backend/`) with a static web UI (`web/`).
-- `ph-network/` — prompt with requirements for flashing Xiaomi AX3000T to OpenWrt and desired LAN/DNS behavior.
+- `vless-mesh/` — VLESS+Reality transport carrying a tinc L2 mesh; includes `setup-server`/`setup-client` scripts, Docker/compose/k8s deployment helpers, and a small Django backend (`backend/`) with a static web UI (`web/`). **Master node runs the mesh server inside a Pod; plan cluster access via its mesh virtual IP (e.g., 10.10.0.X), not the bare host IP. Update kubeconfig/clients accordingly once the mesh is up.**
+
+### VLESS mesh UI
+- Веб-UI доступен только с мастер-ноды через её mesh-IP (не host-IP).
+- Страница `/login`: два блока — вход для уже зарегистрированных пользователей и заявка на регистрацию (почта + комментарий). Без учётки можно только отправить заявку.
+- Админ может подтвердить заявку из UI: добавить `?admin=1` к URL и указать `X-Mesh-Admin-Token` (env `MESH_ADMIN_TOKEN`, по умолчанию `mesh-admin`). При одобрении генерируется access_key, его видно в списке заявок и им же логинятся.
+- Django backend (sqlite по умолчанию) содержит модель заявок. Запуск: `python manage.py migrate && python manage.py runserver 0.0.0.0:8001` (или через docker compose). Новые endpoints: `POST /api/requests`, `GET /api/requests/list`, `POST /api/requests/<id>/approve|decline`, `POST /api/login`.
 
 ## Fresh session checklist
 - Use kubeconfig from bootstrap: `/home/gt/.kube/config`.
@@ -25,7 +30,6 @@ sudo ./bootstrap-master.sh --yes \
   --k8s-version 1.33.0 \
   --containerd-version 2.0.3 \
   --modules "dns gpu registry storage vless-mesh"
-# add --with-ph-network to apply that module too
 ```
 If you omit versions, the script pulls the latest stable Kubernetes from pkgs.k8s.io and the latest upstream runc/containerd. It resets any existing kubeadm state (unless `--skip-reset`), installs prerequisites, runs `kubeadm init` with Calico, then applies manifests or `install.sh` found in each selected module directory. Use `--wipe-all` for a full teardown (kubeadm reset + purge k8s/containerd/docker + remove data/config) before bootstrapping. Docker Engine (docker-ce + containerd.io) is installed automatically for image builds.
 

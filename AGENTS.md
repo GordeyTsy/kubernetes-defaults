@@ -8,6 +8,8 @@ Use these steps when opening a new shell so `kubectl`/manifests work and storage
    `env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy kubectl get nodes`
 3) Verify cluster is reachable and Longhorn is up:  
    `kubectl -n longhorn-system get pods -o wide`
+4) If `vless-mesh` is enabled, remember the master hosts the mesh server **inside a Pod**. Use the mesh virtual IP you assigned (e.g., `10.10.0.X`) when talking to the cluster API instead of the host IP; adjust kubeconfig/clients after the mesh is up.
+5) Веб-UI vless-mesh доступен только с мастер-ноды по её mesh-IP. Страница `/login`: вход для зарегистрированных и форма заявки (почта + комментарий). Админ может смотреть/подтверждать заявки в UI (временный режим: добавить `?admin=1` к URL).
 
 ## Run bootstrap (host-based)
 ```
@@ -15,7 +17,7 @@ sudo ./bootstrap-master.sh --yes \
   --k8s-version 1.33.0 \
   --containerd-version 2.0.3 \
   --modules "dns gpu registry storage vless-mesh"
-# add --with-ph-network if needed
+# ph-network is maintained in a separate repository now.
 ```
 Notes: script resets kubeadm unless `--skip-reset`; installs containerd/runc, Calico, and applies each module (uses install.sh if present).
 
@@ -38,3 +40,21 @@ Notes: script resets kubeadm unless `--skip-reset`; installs containerd/runc, Ca
 - Check Longhorn disks on node: `kubectl get nodes gt-pc -o json | jq -r '.metadata.annotations["node.longhorn.io/default-disks-config"]' | jq .`
 - Forward Longhorn UI: `kubectl -n longhorn-system port-forward svc/longhorn-frontend 9999:80`
 
+## Control-plane IP changed?
+Use the helper to retarget manifests/certs after the host IP moves:
+`sudo k8s-bootstrap/fix-control-plane-ip.sh <new_ip>`
+Then verify without proxies: `env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy kubectl get nodes`.
+
+## VIP / kube-vip for API
+Bootstrap supports setting a control-plane VIP (ARP via kube-vip) so new nodes/clients hit a stable endpoint:
+- Run master bootstrap with `--control-plane-vip <vip>` (optionally `--vip-interface <if>`). The script sets `controlPlaneEndpoint` to the VIP and drops a static kube-vip pod under `/etc/kubernetes/manifests/`.
+- Verify kube-vip: `kubectl -n kube-system get pod kube-vip-*` and `ip addr show <if>` contains the VIP.
+
+## Public/mesh API endpoint (no VIP)
+If you have a stable API endpoint that is not an ARP VIP (public IP / mesh IP / DNS), use:
+- `sudo ./bootstrap-master.sh --public-api-endpoint <host:port> ...` to set kubeadm `controlPlaneEndpoint` and retarget kubeconfigs.
+
+## Client/worker bootstrap (mesh-aware)
+Use `--client-only` to install containerd + kubeadm/kubelet/kubectl without control-plane init; optional helpers:
+- Join: pass `--join-command "<kubeadm join ...>"`.
+- Mesh client: `--mesh-server-addr <srv> --mesh-ip <ip> --mesh-token <token> [--mesh-pub-addr <addr>] [--mesh-dial-only]` to auto-run `vless-mesh/setup-client` so API is reachable via mesh.
