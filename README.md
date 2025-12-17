@@ -25,13 +25,29 @@ Opinionated kubeadm bootstrap plus a grab‑bag of cluster modules and mesh tool
 - Проверить Longhorn: `kubectl -n longhorn-system get pods -o wide`.
 
 ## Bootstrapping a control-plane
+
+### New Method (Explicit versions)
+To prepare a node (master or worker) with strict versions (K8s 1.34, containerd 2.2.0, runc 1.4.0) on Ubuntu 24.04:
+
+```bash
+sudo ./k8s-bootstrap/install-kubeadm.sh
+```
+
+Then run `kubeadm init` (for master) or `kubeadm join` (for worker).
+
+To clean up a node completely:
+```bash
+sudo ./k8s-bootstrap/uninstall-kubeadm.sh
+```
+
+### Legacy Wrapper
 ```bash
 sudo ./bootstrap-master.sh --yes \
   --k8s-version 1.33.0 \
   --containerd-version 2.0.3 \
   --modules "dns gpu registry storage vless-mesh"
 ```
-If you omit versions, the script pulls the latest stable Kubernetes from pkgs.k8s.io and the latest upstream runc/containerd. It resets any existing kubeadm state (unless `--skip-reset`), installs prerequisites, runs `kubeadm init` with Calico, then applies manifests or `install.sh` found in each selected module directory. Use `--wipe-all` for a full teardown (kubeadm reset + purge k8s/containerd/docker + remove data/config) before bootstrapping. Docker Engine (docker-ce + containerd.io) is installed automatically for image builds.
+If you omit versions, the legacy script pulls the latest stable Kubernetes from pkgs.k8s.io and the latest upstream runc/containerd. It resets any existing kubeadm state (unless `--skip-reset`), installs prerequisites, runs `kubeadm init` with Calico, then applies manifests or `install.sh` found in each selected module directory. Use `--wipe-all` for a full teardown (kubeadm reset + purge k8s/containerd/docker + remove data/config) before bootstrapping. Docker Engine (docker-ce + containerd.io) is installed automatically for image builds.
 
 Bootstrap order: cluster core → Calico → storage (Longhorn) → registry (PVC on Longhorn, prefers `longhorn-hdd`) → build/push module images (e.g. `dns/`) → remaining modules. DNS module patches CoreDNS to use dnscrypt-proxy by default with fallback 8.8.8.8.
 
