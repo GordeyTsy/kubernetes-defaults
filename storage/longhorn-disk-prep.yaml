@@ -68,7 +68,7 @@ data:
     fi
 
     DISK_CFG=()
-    MIN_BYTES=$((8 * 1024 * 1024 * 1024))
+    MIN_BYTES=$((5 * 1024 * 1024 * 1024))
 
     for entry in "${CANDIDATES[@]}"; do
       IFS=':' read -r name tag mountpoint fstype <<<"${entry}"
@@ -129,8 +129,13 @@ data:
       DISK_CFG+=( "$(jq -nc --arg name "disk-${name}" --arg path "${mnt}" --arg tag "${tag}" '{name:$name,path:$path,allowScheduling:true,tags:[$tag]}')" )
     done
 
-    # Always include the Longhorn default disk path with a tag based on the root device
+    # Handle Default Disk (usually /var/lib/longhorn/)
+    # Instead of blindly creating "default-disk-root", we check if Longhorn already added one.
+    # If so, we just tag it. If not, we add it.
+
     default_path="/var/lib/longhorn/"
+    
+    # Check rotational status of root
     root_src="$(nsenter --target 1 --mount --uts --ipc --net --pid -- findmnt -n -o SOURCE / || true)"
     root_dev="$(nsenter --target 1 --mount --uts --ipc --net --pid -- readlink -f "${root_src}" 2>/dev/null || true)"
     root_block="$(basename "${root_dev:-}" | sed 's/[0-9]*$//')"
@@ -142,7 +147,58 @@ data:
     if [[ "${rota}" == "0" ]]; then
       default_tag="ssd"
     fi
-    DISK_CFG+=( "$(jq -nc --arg name "default-disk-root" --arg path "${default_path}" --arg tag "${default_tag}" '{name:$name,path:$path,allowScheduling:true,storageReserved:42949672960,tags:[$tag]}')" )
+
+    # Check if we already have a disk pointing to default_path in DISK_CFG (unlikely from lsblk scan)
+    # But more importantly, we need to handle the case where Longhorn Manager created "default-disk-<uuid>"
+    
+    # We will assume that if we are running this, we might be the ones configuring it.
+    # But to follow the prompt's issue: we'll add "default-disk-root" ONLY if NO other disk points there.
+    # The patching logic later handles "merge", so if we send a spec with "default-disk-root", 
+    # and the node already has "default-disk-uuid", we get two.
+    
+    # Since we can't easily query the K8s API for the EXISTING node spec from within this script 
+    # (unless we use kubectl, which we do have), let's try to be smart.
+    
+    # Strategy: 
+    # 1. Provide the lsblk candidates (real mounts).
+    # 2. Add default-disk-root ONLY if we don't detect a mount at /var/lib/longhorn earlier.
+    
+    # But the conflict was with Longhorn's auto-generated disk.
+    # We should rely on Longhorn's auto-generation or manage it fully.
+    # If we want to manage it, we should likely disable auto-create in Longhorn values, but we are just deploying manifest.
+    
+    # Better fix: explicitly check for 'default-disk-root' in current Node if it exists? No.
+    
+    # We will simply NOT output "default-disk-root" if we are running as an enhancement script. 
+    # But we want to ensure it gets the TAG.
+    
+    # For now, let's remove the "default-disk-root" addition block entirely. 
+    # Instead, we will rely on a separate loop to TAG existing disks in the node patch?
+    # Or simpler: The user wants SAFETY.
+    
+    # Let's add it but named "default-disk-root". 
+    # The issue is `node.longhorn.io/default-disks-config` annotation.
+    # Longhorn uses this annotation to create disks ONCE.
+    # If Longhorn already created `default-disk-<uuid>` because it started before we patched the annotation,
+    # then our annotation is ignored or causes double?
+    
+    # The prep script runs continuously.
+    # Let's change logic:
+    # Use `kubectl` to fetch current disks, find one with path /var/lib/longhorn/, and tag IT.
+    # If none found, ADD default-disk-root.
+    
+    echo "[prep] Checking for existing default disk at ${default_path}..."
+    current_node_json=$(kubectl -n longhorn-system get nodes.longhorn.io "${NODE_NAME}" -o json 2>/dev/null || echo "{}")
+    existing_default_name=$(echo "${current_node_json}" | jq -r --arg path "${default_path}" '.spec.disks | to_entries[] | select(.value.path == $path) | .key' 2>/dev/null | head -1)
+    
+    if [[ -n "${existing_default_name}" ]]; then
+        echo "[prep] Found existing default disk '${existing_default_name}'. Ensuring tag '${default_tag}'..."
+        # We append a config entry that matches the EXISTING name, ensuring we update tags
+        DISK_CFG+=( "$(jq -nc --arg name "${existing_default_name}" --arg path "${default_path}" --arg tag "${default_tag}" '{name:$name,path:$path,allowScheduling:true,storageReserved:42949672960,tags:[$tag]}')" )
+    else
+        echo "[prep] No existing default disk found. Adding 'default-disk-root'..."
+        DISK_CFG+=( "$(jq -nc --arg name "default-disk-root" --arg path "${default_path}" --arg tag "${default_tag}" '{name:$name,path:$path,allowScheduling:true,storageReserved:42949672960,tags:[$tag]}')" )
+    fi
 
     if [[ ${#DISK_CFG[@]} -eq 0 ]]; then
       echo "[prep] Nothing to configure for Longhorn."

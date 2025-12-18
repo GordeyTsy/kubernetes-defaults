@@ -47,5 +47,11 @@ EOF
   kubectl -n kube-system rollout restart deploy/coredns
 }
 
+# --- Execution ---
+if [[ -f "${SCRIPT_DIR}/build.sh" ]]; then
+  echo "[dns] Building DNS module..."
+  (cd "${SCRIPT_DIR}" && ./build.sh)
+fi
+
 apply_dnscrypt
 patch_coredns
