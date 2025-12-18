@@ -8,6 +8,7 @@ spec:
   resources:
     requests:
       storage: 20Gi
+  storageClassName: longhorn-hdd
 ---
 apiVersion: v1
 kind: ConfigMap
