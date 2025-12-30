@@ -95,6 +95,17 @@ wait_for_resource() {
   fi
 }
 
+ensure_kube_dns_policy() {
+  if kubectl -n kube-system get svc kube-dns >/dev/null 2>&1; then
+    local policy=""
+    policy="$(kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.internalTrafficPolicy}' 2>/dev/null || true)"
+    if [[ "${policy}" == "Local" ]]; then
+      log "Resetting kube-dns internalTrafficPolicy=Cluster"
+      kubectl -n kube-system patch svc kube-dns --type=merge -p '{"spec":{"internalTrafficPolicy":"Cluster"}}' >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
 # --- Calico ---
 log "Checking for localhost in /etc/hosts..."
 if ! grep -q "127.0.0.1 localhost" /etc/hosts; then
@@ -134,6 +145,8 @@ for i in {1..60}; do
 done
 wait_for_resource daemonset calico-node calico-system 300s
 log "Calico is Ready."
+
+ensure_kube_dns_policy
 
 log "Untainting control-plane..."
 kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
