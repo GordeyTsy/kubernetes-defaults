@@ -43,7 +43,146 @@ data:
     HOST_DEV="/host/dev"
     HOST_ETC="/host/etc"
     DISK_BASE="/var/lib/longhorn/disks"
+    RAID_SSD_MAX_BYTES=$((1200 * 1024 * 1024 * 1024))
     mkdir -p "/host${DISK_BASE}"
+
+    host_cmd() {
+      nsenter --target 1 --mount --uts --ipc --net --pid -- "$@"
+    }
+
+    resolve_base_devices() {
+      local dev="$1"
+      local real=""
+      local name=""
+      local parent=""
+      real="$(host_cmd readlink -f "$dev" 2>/dev/null || true)"
+      if [[ -z "$real" ]]; then
+        return 1
+      fi
+      name="${real##*/}"
+      if [[ "$name" == dm-* || "$name" == md* ]]; then
+        host_cmd bash -lc "ls /sys/block/${name}/slaves 2>/dev/null" | sed '/^$/d'
+        return 0
+      fi
+      parent="$(host_cmd lsblk -no PKNAME "/dev/${name}" 2>/dev/null | head -1 | tr -d '[:space:]')"
+      if [[ -n "$parent" ]]; then
+        echo "$parent"
+      else
+        echo "$name"
+      fi
+    }
+
+    udev_is_ssd() {
+      local dev="$1"
+      local props=""
+      if ! host_cmd command -v udevadm >/dev/null 2>&1; then
+        return 1
+      fi
+      props="$(host_cmd udevadm info --query=property --name "$dev" 2>/dev/null || true)"
+      if echo "$props" | grep -q '^ID_SSD=1'; then
+        return 0
+      fi
+      if echo "$props" | grep -q '^ID_ATA_ROTATION_RATE_RPM=0'; then
+        return 0
+      fi
+      if echo "$props" | grep -q '^ID_NVME=1'; then
+        return 0
+      fi
+      return 1
+    }
+
+    device_model() {
+      local base="$1"
+      host_cmd lsblk -d -no MODEL "/dev/${base}" 2>/dev/null | tr -d '[:space:]'
+    }
+
+    device_size_bytes() {
+      local base="$1"
+      host_cmd lsblk -b -d -no SIZE "/dev/${base}" 2>/dev/null | head -1 | tr -d '[:space:]'
+    }
+
+    device_is_raid_controller() {
+      local base="$1"
+      local model=""
+      model="$(device_model "$base" | tr '[:lower:]' '[:upper:]')"
+      if [[ -z "$model" ]]; then
+        return 1
+      fi
+      echo "$model" | grep -Eq 'PERC|MEGARAID|SMARTARRAY|SMART-ARRAY|RAID|LSI|HBA'
+    }
+
+    smartctl_is_ssd() {
+      local base="$1"
+      local out=""
+      if ! command -v smartctl >/dev/null 2>&1; then
+        return 1
+      fi
+      out="$(smartctl -i "/host/dev/${base}" 2>/dev/null || true)"
+      if echo "$out" | grep -qi 'Solid State Device'; then
+        return 0
+      fi
+      if echo "$out" | grep -qi 'Rotation Rate:.*Solid State'; then
+        return 0
+      fi
+      return 1
+    }
+
+    device_is_ssd() {
+      local dev="$1"
+      local bases=()
+      local base=""
+      local rota=""
+      mapfile -t bases < <(resolve_base_devices "$dev" 2>/dev/null || true)
+      if [[ ${#bases[@]} -eq 0 ]]; then
+        return 1
+      fi
+      for base in "${bases[@]}"; do
+        if [[ "$base" == nvme* ]]; then
+          return 0
+        fi
+        if udev_is_ssd "/dev/${base}"; then
+          return 0
+        fi
+        if smartctl_is_ssd "${base}"; then
+          return 0
+        fi
+        rota="$(host_cmd cat "/sys/block/${base}/queue/rotational" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ -z "$rota" ]]; then
+          rota="$(host_cmd lsblk -no ROTA "/dev/${base}" 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+        fi
+        if [[ "$rota" == "0" ]]; then
+          return 0
+        fi
+        if [[ "$rota" == "1" ]] && device_is_raid_controller "$base"; then
+          local size_bytes=""
+          size_bytes="$(device_size_bytes "$base")"
+          if [[ -n "$size_bytes" && "$size_bytes" -le "$RAID_SSD_MAX_BYTES" ]]; then
+            return 0
+          fi
+        fi
+      done
+      return 1
+    }
+
+    detect_disk_tag() {
+      local dev="$1"
+      if device_is_ssd "$dev"; then
+        echo "ssd"
+      else
+        echo "hdd"
+      fi
+    }
+
+    detect_mount_source() {
+      local path="$1"
+      local src=""
+      src="$(host_cmd findmnt -n -o SOURCE "$path" 2>/dev/null || true)"
+      if [[ "$src" == /dev/* ]]; then
+        echo "$src"
+        return 0
+      fi
+      return 1
+    }
 
     echo "[prep] Scanning disks on ${NODE_NAME}..."
     nsenter --target 1 --mount --uts --ipc --net --pid -- lsblk -J -o NAME,TYPE,ROTA,MOUNTPOINT,FSTYPE,PKNAME,TRAN,MODEL > /tmp/lsblk.json
@@ -76,6 +215,7 @@ data:
       IFS=':' read -r name tag mountpoint fstype <<<"${entry}"
       dev_host="${HOST_DEV}/${name}"
       dev_mount="/dev/${name}"
+      tag="$(detect_disk_tag "${dev_mount}")"
       if [[ -n "${mountpoint}" ]]; then
         mnt="${mountpoint}"
         existing_mount=1
@@ -138,16 +278,10 @@ data:
     default_path="/var/lib/longhorn/"
     
     # Check rotational status of root
-    root_src="$(nsenter --target 1 --mount --uts --ipc --net --pid -- findmnt -n -o SOURCE / || true)"
-    root_dev="$(nsenter --target 1 --mount --uts --ipc --net --pid -- readlink -f "${root_src}" 2>/dev/null || true)"
-    root_block="$(basename "${root_dev:-}" | sed 's/[0-9]*$//')"
-    rota="1"
-    if [[ -n "${root_block}" && -r "/sys/block/${root_block}/queue/rotational" ]]; then
-      rota="$(cat "/sys/block/${root_block}/queue/rotational" 2>/dev/null | tr -d '[:space:]' || echo 1)"
-    fi
+    root_src="$(detect_mount_source "${default_path}" || detect_mount_source "/" || true)"
     default_tag="hdd"
-    if [[ "${rota}" == "0" ]]; then
-      default_tag="ssd"
+    if [[ -n "${root_src}" ]]; then
+      default_tag="$(detect_disk_tag "${root_src}")"
     fi
 
     # Check if we already have a disk pointing to default_path in DISK_CFG (unlikely from lsblk scan)
@@ -297,7 +431,7 @@ spec:
                 fi
                 echo "[prep] Missing deps; attempting apt-get install..."
                 if apt-get update -y; then
-                  if apt-get install -y --no-install-recommends util-linux e2fsprogs jq curl ca-certificates bash; then
+                  if apt-get install -y --no-install-recommends util-linux e2fsprogs jq curl ca-certificates bash smartmontools; then
                     rm -rf /var/lib/apt/lists/*
                     return 0
                   fi
