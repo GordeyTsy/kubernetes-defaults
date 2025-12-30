@@ -18,10 +18,12 @@ data:
     CTR_DIR1="/host/etc/containerd/certs.d/registry"
     CTR_CA1="${CTR_DIR1}/ca.crt"
     CTR_HOSTS1="${CTR_DIR1}/hosts.toml"
+    CTR_CA1_HOST="/etc/containerd/certs.d/registry/ca.crt"
 
     CTR_DIR2="/host/etc/containerd/certs.d/registry:443"
     CTR_CA2="${CTR_DIR2}/ca.crt"
     CTR_HOSTS2="${CTR_DIR2}/hosts.toml"
+    CTR_CA2_HOST="/etc/containerd/certs.d/registry:443/ca.crt"
 
     DOCKER_DIR1="/host/etc/docker/certs.d/registry"
     DOCKER_CA1="${DOCKER_DIR1}/ca.crt"
@@ -61,7 +63,11 @@ data:
       # Берём актуальный ClusterIP сервиса через DNS внутри пода
       local ip
       ip="$(getent ahostsv4 "${REG_FQDN}" | awk 'NR==1{print $1}')"
-      [ -n "${ip:-}" ] || { echo "[registry-cert] WARN: can't resolve ${REG_FQDN}"; return 1; }
+      if [ -z "${ip:-}" ] && [ -n "${REGISTRY_SERVICE_HOST:-}" ]; then
+        ip="${REGISTRY_SERVICE_HOST}"
+        echo "[registry-cert] DNS failed; using REGISTRY_SERVICE_HOST=${ip}"
+      fi
+      [ -n "${ip:-}" ] || { echo "[registry-cert] WARN: can't resolve ${REG_FQDN} and no REGISTRY_SERVICE_HOST"; return 1; }
 
       # Удалим любые старые строки, где среди имён встречается ${REG_NAME}
       if grep -qw "${REG_NAME}" "$HOSTS_FILE"; then
@@ -127,8 +133,8 @@ data:
       copy_if_changed "$CERT_SRC" "$DOCKER_CA2" || true
 
       # 2) hosts.toml для containerd (host и host:443)
-      ensure_hosts_toml "${REG_NAME}"     "${CTR_CA1}" "${CTR_HOSTS1}" && UPDATED_CTR=1 || true
-      ensure_hosts_toml "${REG_NAME}:443" "${CTR_CA2}" "${CTR_HOSTS2}" && UPDATED_CTR=1 || true
+      ensure_hosts_toml "${REG_NAME}"     "${CTR_CA1_HOST}" "${CTR_HOSTS1}" && UPDATED_CTR=1 || true
+      ensure_hosts_toml "${REG_NAME}:443" "${CTR_CA2_HOST}" "${CTR_HOSTS2}" && UPDATED_CTR=1 || true
 
       # 3) /etc/hosts → единственная актуальная строка "ClusterIP registry"
       ensure_hosts_mapping || true
@@ -179,7 +185,7 @@ spec:
           effect: "NoSchedule"
       containers:
         - name: installer
-          image: alpine:3.20
+          image: ubuntu:24.04
           securityContext:
             privileged: true
             runAsUser: 0
@@ -196,11 +202,10 @@ spec:
             # пример: "registry:443/codex-dev-check:latest registry/codex-registry-test:v1"
             - name: PREPULL_IMAGES
               value: ""
-          command: ["/bin/sh","-c"]
+          command: ["/bin/bash","-c"]
           args:
             - |
               set -eux
-              apk add --no-cache bash util-linux coreutils bind-tools ca-certificates
               /bin/bash /opt/bin/install.sh
           volumeMounts:
             - name: registry-tls

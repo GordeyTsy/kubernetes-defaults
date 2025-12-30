@@ -36,6 +36,30 @@ sudo ./install-worker.sh <флаги-джойна...>
 sudo ./install-worker.sh 192.168.1.133:6443 --token <токен> --discovery-token-ca-cert-hash sha256:<хеш>
 ```
 
+### 3. Mesh-оверлей (VLESS)
+Используйте, когда ноды не могут общаться напрямую. Mesh переводит ноды на `10.10.0.0/24` (по умолчанию) и прописывает kubelet `--node-ip` в mesh-адрес.
+
+**Master (control-plane)**:
+```bash
+sudo ./vless-mesh/setup-server --pub-addr <MASTER_PUBLIC_IP>
+# Опционально: --mesh-ip auto (по умолчанию), --image-registry registry:443/
+```
+Примечания:
+- `setup-server` запускает tinc/xray, пишет `/etc/vless-mesh/*` и по умолчанию выставляет kubelet `--node-ip` на mesh-IP.
+- Если `kubectl` настроен, автоматически применяет DaemonSet клиентов на все не-control-plane ноды (используйте `--no-k8s-clients`, чтобы отключить).
+
+**Worker (одной командой)**:
+```bash
+sudo ./install-worker.sh \
+  --mesh-server-addr <MASTER_PUBLIC_IP> \
+  --mesh-token <TOKEN> \
+  --mesh-ip auto \
+  <флаги-join...>
+```
+Примечания:
+- `install-worker.sh` отключает proxy env перед `kubeadm join`.
+- Чтобы заранее поднять mesh без join, запускайте ту же команду без флагов join.
+
 ---
 
 ## Подробное описание проекта

@@ -46,12 +46,14 @@ data:
     mkdir -p "/host${DISK_BASE}"
 
     echo "[prep] Scanning disks on ${NODE_NAME}..."
-    nsenter --target 1 --mount --uts --ipc --net --pid -- lsblk -J -o NAME,TYPE,ROTA,MOUNTPOINT,FSTYPE,PKNAME > /tmp/lsblk.json
+    nsenter --target 1 --mount --uts --ipc --net --pid -- lsblk -J -o NAME,TYPE,ROTA,MOUNTPOINT,FSTYPE,PKNAME,TRAN,MODEL > /tmp/lsblk.json
     mapfile -t CANDIDATES < <(jq -r '
       .. | objects
       | select(.type=="disk" or .type=="part")
       | select(.name|test("^(sd|vd|xvd|nvme|mmcblk)"))
       | select(.fstype==null or .fstype=="ext4")
+      | select((.tran // "") != "iscsi")
+      | select((.model // "") | test("Virtual Disk") | not)
       | select(if .type=="disk" then ((.children|length)==0 or .children==null) else true end)
       | "\(.name):\(
           if (.rota == false or .rota == 0 or .rota == "0") then
@@ -262,7 +264,7 @@ spec:
       serviceAccountName: longhorn-disk-prep
       hostPID: true
       hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
+      dnsPolicy: Default
       tolerations:
         - key: "node-role.kubernetes.io/control-plane"
           operator: "Exists"
@@ -285,14 +287,36 @@ spec:
             - |
               set -e
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update -y
-              apt-get install -y --no-install-recommends util-linux e2fsprogs jq curl ca-certificates bash
-              rm -rf /var/lib/apt/lists/*
-              cp /opt/prep/prep.sh /usr/local/bin/prep.sh
-              chmod +x /usr/local/bin/prep.sh
-              bash /usr/local/bin/prep.sh
-              # stay alive so DaemonSet is Ready; re-run every 10 minutes
-              while true; do sleep 600; bash /usr/local/bin/prep.sh || true; done
+              ensure_deps() {
+                missing=0
+                for bin in bash jq nsenter lsblk mountpoint blkid wipefs mkfs.ext4; do
+                  command -v "$bin" >/dev/null 2>&1 || missing=1
+                done
+                if [ "$missing" -eq 0 ]; then
+                  return 0
+                fi
+                echo "[prep] Missing deps; attempting apt-get install..."
+                if apt-get update -y; then
+                  if apt-get install -y --no-install-recommends util-linux e2fsprogs jq curl ca-certificates bash; then
+                    rm -rf /var/lib/apt/lists/*
+                    return 0
+                  fi
+                fi
+                return 1
+              }
+
+              while true; do
+                if ensure_deps; then
+                  cp /opt/prep/prep.sh /usr/local/bin/prep.sh
+                  chmod +x /usr/local/bin/prep.sh
+                  /usr/local/bin/prep.sh || true
+                  # stay alive so DaemonSet is Ready; re-run every 10 minutes
+                  sleep 600
+                else
+                  echo "[prep] WARN: dependency install failed; retrying in 60s."
+                  sleep 60
+                fi
+              done
           volumeMounts:
             - name: script
               mountPath: /opt/prep/prep.sh

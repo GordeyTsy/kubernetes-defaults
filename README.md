@@ -36,6 +36,30 @@ sudo ./install-worker.sh <kubeadm-join-command-flags...>
 sudo ./install-worker.sh 192.168.1.133:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
 ```
 
+### 3. Mesh Overlay (VLESS)
+Use this when nodes cannot reach each other directly. The mesh puts nodes on `10.10.0.0/24` (by default) and rewrites kubelet node IPs to mesh addresses.
+
+**Master (control-plane)**:
+```bash
+sudo ./vless-mesh/setup-server --pub-addr <MASTER_PUBLIC_IP>
+# Optional: --mesh-ip auto (default), --image-registry registry:443/
+```
+Notes:
+- `setup-server` starts tinc/xray, writes `/etc/vless-mesh/*`, and (by default) sets kubelet `--node-ip` to the mesh IP.
+- If `kubectl` is configured, it auto-applies the mesh client DaemonSet to non-control-plane nodes (use `--no-k8s-clients` to skip).
+
+**Worker (single command)**:
+```bash
+sudo ./install-worker.sh \
+  --mesh-server-addr <MASTER_PUBLIC_IP> \
+  --mesh-token <TOKEN> \
+  --mesh-ip auto \
+  <kubeadm-join-flags...>
+```
+Notes:
+- `install-worker.sh` disables proxy envs before `kubeadm join`.
+- If you want to pre-bootstrap mesh before joining, run the same command without the join flags.
+
 ---
 
 ## Project Description
