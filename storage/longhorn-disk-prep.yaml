@@ -196,10 +196,10 @@ data:
     if [[ -n "${existing_default_name}" ]]; then
         echo "[prep] Found existing default disk '${existing_default_name}'. Ensuring tag '${default_tag}'..."
         # We append a config entry that matches the EXISTING name, ensuring we update tags
-        DISK_CFG+=( "$(jq -nc --arg name "${existing_default_name}" --arg path "${default_path}" --arg tag "${default_tag}" '{name:$name,path:$path,allowScheduling:true,storageReserved:42949672960,tags:[$tag]}')" )
+        DISK_CFG+=( "$(jq -nc --arg name "${existing_default_name}" --arg path "${default_path}" --arg tag "${default_tag}" '{name:$name,path:$path,allowScheduling:true,storageReserved:0,tags:[$tag]}')" )
     else
         echo "[prep] No existing default disk found. Adding 'default-disk-root'..."
-        DISK_CFG+=( "$(jq -nc --arg name "default-disk-root" --arg path "${default_path}" --arg tag "${default_tag}" '{name:$name,path:$path,allowScheduling:true,storageReserved:42949672960,tags:[$tag]}')" )
+        DISK_CFG+=( "$(jq -nc --arg name "default-disk-root" --arg path "${default_path}" --arg tag "${default_tag}" '{name:$name,path:$path,allowScheduling:true,storageReserved:0,tags:[$tag]}')" )
     fi
 
     if [[ ${#DISK_CFG[@]} -eq 0 ]]; then
