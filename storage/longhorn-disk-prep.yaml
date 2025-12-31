@@ -96,6 +96,35 @@ data:
       host_cmd lsblk -d -no MODEL "/dev/${base}" 2>/dev/null | tr -d '[:space:]'
     }
 
+    device_model_key() {
+      local base="$1"
+      local model=""
+      local vendor=""
+      model="$(host_cmd cat "/sys/block/${base}/device/model" 2>/dev/null | tr -d '\n' | sed 's/[[:space:]]*$//')"
+      vendor="$(host_cmd cat "/sys/block/${base}/device/vendor" 2>/dev/null | tr -d '\n' | sed 's/[[:space:]]*$//')"
+      printf '%s %s' "${vendor}" "${model}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]'
+    }
+
+    device_model_is_ssd() {
+      local base="$1"
+      local key=""
+      key="$(device_model_key "$base")"
+      if [[ -z "$key" ]]; then
+        return 1
+      fi
+      echo "$key" | grep -Eq 'SSD|SOLIDSTATE|NVME|NVMEXPRESS'
+    }
+
+    device_discard_max_bytes() {
+      local base="$1"
+      host_cmd cat "/sys/block/${base}/queue/discard_max_bytes" 2>/dev/null | tr -d '[:space:]'
+    }
+
+    device_discard_granularity() {
+      local base="$1"
+      host_cmd cat "/sys/block/${base}/queue/discard_granularity" 2>/dev/null | tr -d '[:space:]'
+    }
+
     device_size_bytes() {
       local base="$1"
       host_cmd lsblk -b -d -no SIZE "/dev/${base}" 2>/dev/null | head -1 | tr -d '[:space:]'
@@ -114,10 +143,10 @@ data:
     smartctl_is_ssd() {
       local base="$1"
       local out=""
-      if ! command -v smartctl >/dev/null 2>&1; then
+      if ! host_cmd command -v smartctl >/dev/null 2>&1; then
         return 1
       fi
-      out="$(smartctl -i "/host/dev/${base}" 2>/dev/null || true)"
+      out="$(host_cmd smartctl -i "/dev/${base}" 2>/dev/null || true)"
       if echo "$out" | grep -qi 'Solid State Device'; then
         return 0
       fi
@@ -132,6 +161,8 @@ data:
       local bases=()
       local base=""
       local rota=""
+      local discard_max=""
+      local discard_gran=""
       mapfile -t bases < <(resolve_base_devices "$dev" 2>/dev/null || true)
       if [[ ${#bases[@]} -eq 0 ]]; then
         return 1
@@ -146,12 +177,22 @@ data:
         if smartctl_is_ssd "${base}"; then
           return 0
         fi
+        if device_model_is_ssd "${base}"; then
+          return 0
+        fi
         rota="$(host_cmd cat "/sys/block/${base}/queue/rotational" 2>/dev/null | tr -d '[:space:]' || true)"
         if [[ -z "$rota" ]]; then
           rota="$(host_cmd lsblk -no ROTA "/dev/${base}" 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
         fi
         if [[ "$rota" == "0" ]]; then
           return 0
+        fi
+        discard_max="$(device_discard_max_bytes "$base")"
+        discard_gran="$(device_discard_granularity "$base")"
+        if [[ "$rota" == "1" ]]; then
+          if [[ "${discard_max:-0}" != "0" || "${discard_gran:-0}" != "0" ]]; then
+            return 0
+          fi
         fi
         if [[ "$rota" == "1" ]] && device_is_raid_controller "$base"; then
           local size_bytes=""
